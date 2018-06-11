@@ -2,8 +2,12 @@ package main
 
 import (
 	"fmt"
-	"github.com/GoogleContainerTools/skaffold/pkg/skaffold/docker"
-	"github.com/sirupsen/logrus"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"gopkg.in/yaml.v2"
+	"io/ioutil"
+	"net/http"
 	"os"
 )
 
@@ -15,8 +19,58 @@ func main() {
 }
 
 func execute() error {
-
+	manifest, err := os.Open("test.yaml")
+	if err != nil {
+		return err
+	}
+	manifestBytes, err := ioutil.ReadAll(manifest)
+	if err != nil {
+		return err
+	}
+	m := make(map[interface{}]interface{})
+	if err := yaml.Unmarshal(manifestBytes, &m); err != nil {
+		return err
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	taggedImages := recursiveGetTaggedImages(m)
+	resolvedImages, err := resolveImages(taggedImages)
+	if err != nil {
+		return err
+	}
+	recursiveReplaceImage(m, resolvedImages)
+	updatedManifest, err := yaml.Marshal(m)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(updatedManifest))
 	return nil
+}
+
+func resolveImages(images []string) (map[string]string, error) {
+	resolvedImages := map[string]string{}
+	for _, image := range images {
+		tag, err := name.NewTag(image, name.WeakValidation)
+		if err != nil {
+			return nil, err
+		}
+		auth, err := authn.DefaultKeychain.Resolve(tag.Registry)
+		if err != nil {
+			return nil, err
+		}
+		sourceImage, err := remote.Image(tag, auth, http.DefaultTransport)
+		if err != nil {
+			return nil, err
+		}
+		digest, err := sourceImage.Digest()
+		if err != nil {
+			return nil, err
+		}
+		digestName := fmt.Sprintf("%s@sha256:%s", tag.Context(), digest.Hex)
+		resolvedImages[image] = digestName
+	}
+	return resolvedImages, nil
 }
 
 func recursiveGetTaggedImages(i interface{}) []string {
@@ -33,13 +87,32 @@ func recursiveGetTaggedImages(i interface{}) []string {
 				continue
 			}
 			image := v.(string)
-			parsed, err := docker.ParseReference(image)
+			_, err := name.NewDigest(image, name.WeakValidation)
 			if err != nil {
-				logrus.Warnf("Couldn't parse image: %s", v)
-				continue
+				images = append(images, image)
 			}
-			images = append(images, parsed.BaseName)
 		}
 	}
 	return images
+}
+
+func recursiveReplaceImage(i interface{}, replacements map[string]string) {
+	switch t := i.(type) {
+	case []interface{}:
+		for _, v := range t {
+			recursiveReplaceImage(v, replacements)
+		}
+	case map[interface{}]interface{}:
+		for k, v := range t {
+			if k.(string) != "image" {
+				recursiveReplaceImage(v, replacements)
+				continue
+			}
+
+			image := v.(string)
+			if img, present := replacements[image]; present {
+				t[k] = img
+			}
+		}
+	}
 }

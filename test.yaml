@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test
+spec:
+  containers:
+  - name: tag
+    image: gcr.io/kaniko-project/executor:latest
+  - name: digest
+    image: gcr.io/priya-wadhwa/debian@sha256:6b3aa04751aa2ac3b0c7be4ee71148b66d693ad212ce6d3244bd2a2a147f314a
+  - name: no-tag
+    image: gcr.io/distroless/base
+  - name: docker
+    image: busybox

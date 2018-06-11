@@ -9,9 +9,21 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
+)
+
+var (
+	cwd   string
+	files []string
 )
 
 func main() {
+	cwd = os.Args[1]
+	files = os.Args[2:]
+	if len(files) == 0 {
+		fmt.Println("please pass in at least one path to a yaml file to resolve")
+		os.Exit(1)
+	}
 	if err := execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -19,33 +31,63 @@ func main() {
 }
 
 func execute() error {
-	manifest, err := os.Open("test.yaml")
-	if err != nil {
-		return err
+	resolveFilepaths()
+	for _, file := range files {
+		contents, err := ioutil.ReadFile(file)
+		if err != nil {
+			return err
+		}
+		m := make(map[interface{}]interface{})
+		if err := yaml.Unmarshal(contents, &m); err != nil {
+			return err
+		}
+		if len(m) == 0 {
+			continue
+		}
+		taggedImages := recursiveGetTaggedImages(m)
+		resolvedImages, err := resolveImages(taggedImages)
+		if err != nil {
+			return err
+		}
+		recursiveReplaceImage(m, resolvedImages)
+		updatedManifest, err := yaml.Marshal(m)
+		if err != nil {
+			return err
+		}
+		printManifest(updatedManifest, file)
 	}
-	manifestBytes, err := ioutil.ReadAll(manifest)
-	if err != nil {
-		return err
-	}
-	m := make(map[interface{}]interface{})
-	if err := yaml.Unmarshal(manifestBytes, &m); err != nil {
-		return err
-	}
-	if len(m) == 0 {
-		return nil
-	}
-	taggedImages := recursiveGetTaggedImages(m)
-	resolvedImages, err := resolveImages(taggedImages)
-	if err != nil {
-		return err
-	}
-	recursiveReplaceImage(m, resolvedImages)
-	updatedManifest, err := yaml.Marshal(m)
-	if err != nil {
-		return err
-	}
-	fmt.Println(string(updatedManifest))
 	return nil
+}
+
+func resolveFilepaths() {
+	for index, file := range files {
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			files[index] = filepath.Join(cwd, file)
+		}
+	}
+}
+
+func recursiveGetTaggedImages(i interface{}) []string {
+	images := []string{}
+	switch t := i.(type) {
+	case []interface{}:
+		for _, v := range t {
+			images = append(images, recursiveGetTaggedImages(v)...)
+		}
+	case map[interface{}]interface{}:
+		for k, v := range t {
+			if k.(string) != "image" {
+				images = append(images, recursiveGetTaggedImages(v)...)
+				continue
+			}
+			image := v.(string)
+			_, err := name.NewDigest(image, name.WeakValidation)
+			if err != nil {
+				images = append(images, image)
+			}
+		}
+	}
+	return images
 }
 
 func resolveImages(images []string) (map[string]string, error) {
@@ -73,29 +115,6 @@ func resolveImages(images []string) (map[string]string, error) {
 	return resolvedImages, nil
 }
 
-func recursiveGetTaggedImages(i interface{}) []string {
-	images := []string{}
-	switch t := i.(type) {
-	case []interface{}:
-		for _, v := range t {
-			images = append(images, recursiveGetTaggedImages(v)...)
-		}
-	case map[interface{}]interface{}:
-		for k, v := range t {
-			if k.(string) != "image" {
-				images = append(images, recursiveGetTaggedImages(v)...)
-				continue
-			}
-			image := v.(string)
-			_, err := name.NewDigest(image, name.WeakValidation)
-			if err != nil {
-				images = append(images, image)
-			}
-		}
-	}
-	return images
-}
-
 func recursiveReplaceImage(i interface{}, replacements map[string]string) {
 	switch t := i.(type) {
 	case []interface{}:
@@ -115,4 +134,10 @@ func recursiveReplaceImage(i interface{}, replacements map[string]string) {
 			}
 		}
 	}
+}
+
+func printManifest(mfst []byte, file string) {
+	// fmt.Println(fmt.Sprintf("------------------ %s ------------------", file))
+	fmt.Println()
+	fmt.Println(string(mfst))
 }

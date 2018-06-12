@@ -9,21 +9,16 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"runtime"
 )
 
 var (
-	cwd   string
-	files []string
+	files = os.Args[1:]
 )
 
 func main() {
-	cwd = os.Args[1]
-	files = os.Args[2:]
-	if len(files) == 0 {
-		fmt.Println("please pass in at least one path to a yaml file to resolve")
-		os.Exit(1)
-	}
 	if err := execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -31,13 +26,18 @@ func main() {
 }
 
 func execute() error {
-	resolveFilepaths()
+	if len(files) == 0 {
+		return fmt.Errorf("please pass in at least one path to a yaml file to resolve")
+	}
+	if err := resolveFilepaths(); err != nil {
+		return fmt.Errorf("error resolving filepaths: %v", err)
+	}
 	for _, file := range files {
 		contents, err := ioutil.ReadFile(file)
 		if err != nil {
 			return err
 		}
-		m := make(map[interface{}]interface{})
+		m := yaml.MapSlice{}
 		if err := yaml.Unmarshal(contents, &m); err != nil {
 			return err
 		}
@@ -45,12 +45,12 @@ func execute() error {
 			continue
 		}
 		taggedImages := recursiveGetTaggedImages(m)
-		resolvedImages, err := resolveImages(taggedImages)
+		resolvedImages, err := resolveTagsToDigests(taggedImages)
 		if err != nil {
 			return err
 		}
-		recursiveReplaceImage(m, resolvedImages)
-		updatedManifest, err := yaml.Marshal(m)
+		replacedYaml := recursiveReplaceImage(m, resolvedImages)
+		updatedManifest, err := yaml.Marshal(replacedYaml)
 		if err != nil {
 			return err
 		}
@@ -59,38 +59,70 @@ func execute() error {
 	return nil
 }
 
-func resolveFilepaths() {
+// resolveFilepaths first checks if a given file path exists
+// If not, it tries to resolve it to an absolute path and checks if that exists
+func resolveFilepaths() error {
+	dir, err := getWorkingDirectory()
+	if err != nil {
+		return err
+	}
 	for index, file := range files {
 		if _, err := os.Stat(file); os.IsNotExist(err) {
-			files[index] = filepath.Join(cwd, file)
+			fullPath := filepath.Join(dir, file)
+			if _, err := os.Stat(fullPath); err != nil {
+				return err
+			}
+			files[index] = fullPath
 		}
 	}
+	return nil
 }
 
-func recursiveGetTaggedImages(i interface{}) []string {
+// getWorkingDirectory gets the directory that the kubectl plugin was called from
+func getWorkingDirectory() (string, error) {
+	_, filename, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("no caller information")
+	}
+	return path.Dir(filename), nil
+}
+
+// recursiveGetTaggedImages recursively gets all images referenced by tags
+// instead of digests
+func recursiveGetTaggedImages(m interface{}) []string {
 	images := []string{}
-	switch t := i.(type) {
-	case []interface{}:
+	switch t := m.(type) {
+	case yaml.MapSlice:
 		for _, v := range t {
 			images = append(images, recursiveGetTaggedImages(v)...)
 		}
-	case map[interface{}]interface{}:
-		for k, v := range t {
-			if k.(string) != "image" {
+	case yaml.MapItem:
+		v := t.Value
+		switch s := v.(type) {
+		case string:
+			if t.Key.(string) != "image" {
 				images = append(images, recursiveGetTaggedImages(v)...)
-				continue
+			} else {
+				image := v.(string)
+				_, err := name.NewDigest(image, name.WeakValidation)
+				if err != nil {
+					images = append(images, image)
+				}
 			}
-			image := v.(string)
-			_, err := name.NewDigest(image, name.WeakValidation)
-			if err != nil {
-				images = append(images, image)
-			}
+		default:
+			images = append(images, recursiveGetTaggedImages(s)...)
+		}
+	case []interface{}:
+		for _, v := range t {
+			images = append(images, recursiveGetTaggedImages(v)...)
 		}
 	}
 	return images
 }
 
-func resolveImages(images []string) (map[string]string, error) {
+// resolveTagsToDigests resolves all images specified by tag to digest
+// It returns a map of the form [image:tag]:[image@sha256:digest]
+func resolveTagsToDigests(images []string) (map[string]string, error) {
 	resolvedImages := map[string]string{}
 	for _, image := range images {
 		tag, err := name.NewTag(image, name.WeakValidation)
@@ -115,29 +147,60 @@ func resolveImages(images []string) (map[string]string, error) {
 	return resolvedImages, nil
 }
 
-func recursiveReplaceImage(i interface{}, replacements map[string]string) {
+// recursiveReplaceImage recursively replaces image:tag to the corresponding image@sha256:digest
+func recursiveReplaceImage(i interface{}, replacements map[string]string) interface{} {
+	var replacedInterface interface{}
 	switch t := i.(type) {
-	case []interface{}:
+	case yaml.MapSlice:
+		var interfaces yaml.MapSlice
 		for _, v := range t {
-			recursiveReplaceImage(v, replacements)
-		}
-	case map[interface{}]interface{}:
-		for k, v := range t {
-			if k.(string) != "image" {
-				recursiveReplaceImage(v, replacements)
-				continue
-			}
-
-			image := v.(string)
-			if img, present := replacements[image]; present {
-				t[k] = img
+			r := recursiveReplaceImage(v, replacements)
+			switch s := r.(type) {
+			case yaml.MapSlice:
+				r := recursiveReplaceImage(s, replacements)
+				interfaces = append(interfaces, r.(yaml.MapItem))
+			case yaml.MapItem:
+				interfaces = append(interfaces, s)
 			}
 		}
+		replacedInterface = interfaces
+	case yaml.MapItem:
+		k := t.Key
+		v := t.Value
+		switch s := v.(type) {
+		case string:
+			if k.(string) == "image" {
+				if img, present := replacements[s]; present {
+					t.Value = img
+				}
+			}
+			return t
+		default:
+			return yaml.MapItem{
+				Key:   k,
+				Value: recursiveReplaceImage(s, replacements),
+			}
+		}
+	case []interface{}:
+		var interfaces []yaml.MapSlice
+		for _, v := range t {
+			r := recursiveReplaceImage(v, replacements)
+			switch s := r.(type) {
+			case yaml.MapSlice:
+				interfaces = append(interfaces, s)
+			case yaml.MapItem:
+				interfaces = append(interfaces, yaml.MapSlice{s})
+			}
+		}
+		replacedInterface = interfaces
 	}
+	return replacedInterface
 }
 
+// printManifest prints the final replaced kubernetes manifest to STDOUT
 func printManifest(mfst []byte, file string) {
-	// fmt.Println(fmt.Sprintf("------------------ %s ------------------", file))
+	fmt.Println()
+	fmt.Println(fmt.Sprintf("--- %s ---", file))
 	fmt.Println()
 	fmt.Println(string(mfst))
 }

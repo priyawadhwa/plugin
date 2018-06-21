@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -15,8 +16,13 @@ import (
 )
 
 var (
-	files = os.Args[1:]
+	logLevel string
+	files    = os.Args[1:]
 )
+
+func init() {
+	flag.StringVar(&logLevel, "verbosity", "", "Set to 'debug' for debug logs")
+}
 
 func main() {
 	if err := execute(); err != nil {
@@ -152,24 +158,27 @@ func recursiveReplaceImage(i interface{}, replacements map[string]string) interf
 	var replacedInterface interface{}
 	switch t := i.(type) {
 	case yaml.MapSlice:
-		var interfaces yaml.MapSlice
-		for _, v := range t {
-			r := recursiveReplaceImage(v, replacements)
+		var mapSlice yaml.MapSlice
+		for _, q := range t {
+			r := recursiveReplaceImage(q, replacements)
 			switch s := r.(type) {
 			case yaml.MapSlice:
-				r := recursiveReplaceImage(s, replacements)
-				interfaces = append(interfaces, r.(yaml.MapItem))
+				t := recursiveReplaceImage(s, replacements)
+				switch u := t.(type) {
+				case yaml.MapItem:
+					mapSlice = append(mapSlice, u)
+				case yaml.MapSlice:
+					mapSlice = append(mapSlice, u...)
+				}
 			case yaml.MapItem:
-				interfaces = append(interfaces, s)
+				mapSlice = append(mapSlice, s)
 			}
 		}
-		replacedInterface = interfaces
+		replacedInterface = mapSlice
 	case yaml.MapItem:
-		k := t.Key
-		v := t.Value
-		switch s := v.(type) {
+		switch s := t.Value.(type) {
 		case string:
-			if k.(string) == "image" {
+			if t.Key.(string) == "image" {
 				if img, present := replacements[s]; present {
 					t.Value = img
 				}
@@ -177,7 +186,7 @@ func recursiveReplaceImage(i interface{}, replacements map[string]string) interf
 			return t
 		default:
 			return yaml.MapItem{
-				Key:   k,
+				Key:   t.Key,
 				Value: recursiveReplaceImage(s, replacements),
 			}
 		}
